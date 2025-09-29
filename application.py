@@ -1,486 +1,341 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-Prompt Chaining CLI (OpenAI or Hugging Face)
---------------------------------------------
-Chain 1 (Planner): produce a JSON plan {steps, assumptions, success_criteria}
-Chain 2 (Answerer): produce a final Markdown answer based on the plan + original request
-
-Usage (OpenAI):
-  export OPENAI_API_KEY="sk-..."
-  python app.py --prompt "Plan a 2-day budget trip to Paris with kids."
-
-Usage (Hugging Face Inference API):
-  export HF_API_TOKEN="hf_..."
-  python app.py --provider hf --model "microsoft/Phi-3-mini-4k-instruct" \
-    --prompt "Plan a 2-day budget trip to Paris with kids."
-
-Options:
-  --provider [openai|hf], --model, --temperature, --top_p, --max_tokens,
-  --api_key (OpenAI), --hf_token (HF), --verbose
-
-Notes:
-  - Default provider: OpenAI (model: gpt-5-chat-latest)
-  - HF uses a simple instruct-style single prompt (messages are flattened)
-  - One-shot JSON repair is attempted if the planner output is malformed.
+Prompt Chaining Application - Recipe Optimizer
+Supports both OpenAI and OpenRouter APIs
 """
-
-from __future__ import annotations
 
 import argparse
 import json
-import logging
 import os
 import sys
-import time
-from typing import Any, Dict, List, Optional
-
-import requests
-
-# ---------------------------- Defaults -------------------------------- #
-
-DEFAULT_OPENAI_MODEL = "gpt-5-chat-latest"
-DEFAULT_HF_MODEL = "microsoft/Phi-3-mini-4k-instruct"
-
-# ---------------------------- Logging --------------------------------- #
-
-LOG = logging.getLogger("prompt_chain")
-_HANDLER = logging.StreamHandler(sys.stderr)
-_HANDLER.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-LOG.addHandler(_HANDLER)
-LOG.setLevel(logging.INFO)
-
-# ---------------------------- Prompts --------------------------------- #
-
-PLANNER_SYSTEM = (
-    "You are a meticulous planning assistant. "
-    "Transform the user's request into a compact execution plan. "
-    "Return STRICT JSON with keys: steps (3-6 short bullet steps), assumptions (list), success_criteria (list). "
-    "No commentary. No markdown. JSON only."
-)
-
-PLANNER_USER_TMPL = """User request:
-{user_prompt}
-
-Return JSON with exactly these keys:
-- steps: array of 3–6 short, numbered steps (strings)
-- assumptions: array of concise assumptions (strings)
-- success_criteria: array of measurable outcomes (strings)
-"""
-
-REPAIR_SYSTEM = (
-    "You are a JSON fixer. Receive broken JSON and return a VALID, MINIMAL JSON that preserves meaning. "
-    "No markdown, no explanation, only the corrected JSON object."
-)
-
-REPAIR_USER_TMPL = """The following JSON failed to parse. Fix it while keeping the same structure and intent.
-Output ONLY valid JSON:
-
-{broken_json_block}
-"""
-
-ANSWER_SYSTEM = (
-    "You are an expert solution writer. Using the provided plan and the user's original request, "
-    "produce a clear, user-friendly Markdown response with:\n"
-    "- A concise title\n- Short sections with headings\n- Bulleted lists where helpful\n"
-    "- A final 'Next Steps' list with 3–5 actionable items\n"
-    "Keep it practical and concrete. Avoid fluff."
-)
-
-ANSWER_USER_TMPL = """Original request:
-{user_prompt}
-
-Execution plan (JSON):
-{plan_json}
-
-Now write the final response in Markdown for the user. Ensure it follows the plan and success criteria.
-"""
-
-# ---------------------------- Utilities ------------------------------- #
-
-def _strip_code_fences(text: str) -> str:
-    """Remove ```json … ``` or ``` … ``` fences if present; otherwise return as-is."""
-    t = text.strip()
-    if t.startswith("```"):
-        # Remove backticks and try to isolate the JSON object/brackets
-        t = t.strip("`")
-        start = t.find("{")
-        end = t.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return t[start : end + 1].strip()
-    return text
+from typing import Dict, Any, Optional
+from openai import OpenAI
 
 
-def _validate_plan_shape(plan: Dict[str, Any]) -> Dict[str, Any]:
-    """Ensure required keys exist and have list types; normalize length constraints."""
-    out: Dict[str, Any] = {}
-    for key in ("steps", "assumptions", "success_criteria"):
-        val = plan.get(key, [])
-        if not isinstance(val, list):
-            val = []
-        out[key] = val
-    out["steps"] = out["steps"][:6]  # cap at 6 steps
-    return out
-
-
-# ---------------------- OpenAI Provider Helpers ----------------------- #
-
-def _make_openai_client(api_key: Optional[str]):
-    """Import and instantiate OpenAI client lazily to avoid hard dependency when using HF."""
-    key = api_key or os.getenv("OPENAI_API_KEY")
-    if not key:
-        LOG.error("OpenAI API key not provided. Use --api_key or set OPENAI_API_KEY.")
-        sys.exit(1)
-    try:
-        from openai import OpenAI  # type: ignore
-    except Exception:
-        LOG.error('OpenAI SDK missing. Install with: pip install "openai>=1.0.0"')
-        sys.exit(2)
-    return OpenAI(api_key=key)
-
-
-def _chat_complete_openai(
-    client: Any,
-    messages: List[Dict[str, str]],
-    *,
-    temperature: float,
-    top_p: float,
-    max_tokens: int,
-    model_name: str,
-    max_retries: int = 2,
-) -> str:
-    """OpenAI chat.completions with minimal retry."""
-    for attempt in range(max_retries + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=model_name,
-                messages=messages,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
+class PromptChainApp:
+    """Two-stage prompt chaining application for recipe optimization"""
+    
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        model: str = "gpt-4-turbo-preview",
+        temperature: float = 0.4,
+        top_p: float = 1.0,
+        max_tokens: int = 1200
+    ):
+        """
+        Initialize the app with API credentials and parameters
+        
+        Args:
+            api_key: OpenAI or OpenRouter API key
+            base_url: Base URL (for OpenRouter use: https://openrouter.ai/api/v1)
+            model: Model name
+            temperature: Sampling temperature
+            top_p: Nucleus sampling parameter
+            max_tokens: Maximum tokens to generate
+        """
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.base_url = base_url
+        self.model = model
+        self.temperature = temperature
+        self.top_p = top_p
+        self.max_tokens = max_tokens
+        
+        if not self.api_key:
+            raise ValueError(
+                "API key required. Set OPENAI_API_KEY environment variable "
+                "or pass api_key parameter"
             )
-            return (resp.choices[0].message.content or "").strip()
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:
-            if attempt >= max_retries:
-                raise
-            sleep_for = 1.5 * (attempt + 1)
-            LOG.warning("OpenAI call failed (%s). Retrying in %.1fs …", exc.__class__.__name__, sleep_for)
-            time.sleep(sleep_for)
-    raise RuntimeError("Exhausted retries talking to OpenAI")
-
-# ------------------ Hugging Face Provider Helpers --------------------- #
-
-def _chat_complete_hf(
-    *,
-    hf_token: str,
-    model_name: str,
-    prompt: str,
-    temperature: float,
-    top_p: float,
-    max_new_tokens: int,
-    max_retries: int = 2,
-) -> str:
-    """Hugging Face Inference API text-generation call (instruct style)."""
-    url = f"https://api-inference.huggingface.co/models/{model_name}"
-    headers = {"Authorization": f"Bearer {hf_token}"}
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": int(max_new_tokens),
-            "temperature": max(0.0, float(temperature)),
-            "top_p": max(0.0, float(top_p)),
-            "return_full_text": False,
-        },
-    }
-    for attempt in range(max_retries + 1):
+        
+        # Initialize OpenAI client (works with OpenRouter too)
+        client_params = {"api_key": self.api_key}
+        if self.base_url:
+            client_params["base_url"] = self.base_url
+        
+        self.client = OpenAI(**client_params)
+        
+        print(f"[INFO] Initialized with model: {self.model}")
+        if self.base_url:
+            print(f"[INFO] Using custom endpoint: {self.base_url}")
+    
+    def call_llm(self, system_prompt: str, user_prompt: str) -> str:
+        """
+        Call the LLM API with given prompts
+        
+        Args:
+            system_prompt: System/instruction prompt
+            user_prompt: User input prompt
+            
+        Returns:
+            Generated text response
+        """
         try:
-            r = requests.post(url, headers=headers, json=payload, timeout=90)
-            if r.status_code == 429:
-                sleep_for = 1.5 * (attempt + 1)
-                LOG.warning("HF 429 RateLimit. Retrying in %.1fs …", sleep_for)
-                time.sleep(sleep_for)
-                continue
-            r.raise_for_status()
-            data = r.json()
-            # Common shapes:
-            # [{"generated_text": "..."}] or {"generated_text": "..."} or plain string
-            if isinstance(data, list) and data and isinstance(data[0], dict) and "generated_text" in data[0]:
-                return str(data[0]["generated_text"]).strip()
-            if isinstance(data, dict) and "generated_text" in data:
-                return str(data["generated_text"]).strip()
-            if isinstance(data, str):
-                return data.strip()
-            # Fallback: stringify everything
-            return json.dumps(data, ensure_ascii=False)
-        except KeyboardInterrupt:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=self.temperature,
+                top_p=self.top_p,
+                max_tokens=self.max_tokens
+            )
+            return response.choices[0].message.content.strip()
+        
+        except Exception as e:
+            print(f"[ERROR] API Error: {e}", file=sys.stderr)
             raise
-        except Exception as exc:
-            if attempt >= max_retries:
-                raise
-            sleep_for = 1.5 * (attempt + 1)
-            LOG.warning("HF call failed (%s). Retrying in %.1fs …", exc.__class__.__name__, sleep_for)
-            time.sleep(sleep_for)
-    raise RuntimeError("Exhausted retries talking to Hugging Face")
+    
+    def stage_1_planning(self, user_input: str) -> Dict[str, Any]:
+        """
+        Stage 1: Create a structured plan from user input
+        
+        Args:
+            user_input: Raw user request
+            
+        Returns:
+            Dictionary with steps, assumptions, and success_criteria
+        """
+        system_prompt = """You are a planning assistant. Your job is to break down user requests into actionable steps.
 
-# -------------------- Provider-Agnostic JSON Repair ------------------- #
+Given a user's request, create a JSON plan with exactly these fields:
+- "steps": array of 3-6 clear, actionable steps
+- "assumptions": array of 2-4 assumptions you're making
+- "success_criteria": array of 2-3 measurable success criteria
 
-def _parse_or_repair_json(
-    *,
-    provider: str,
-    model_name: str,
-    client: Optional[Any],
-    hf_token: Optional[str],
-    raw_text: str,
-    temperature: float,
-    top_p: float,
-    max_tokens: int,
-) -> Dict[str, Any]:
-    """Try to parse JSON; if it fails, repair once via the same provider."""
-    candidate = _strip_code_fences(raw_text)
-    try:
-        return json.loads(candidate)
-    except Exception:
-        LOG.info("Planner JSON parse failed. Attempting one-shot repair.")
+Keep steps concise but specific. Focus on practical actions.
+Output ONLY valid JSON, no markdown formatting or explanation."""
 
-    # Prepare repair prompt (flattened for both providers)
-    block = candidate.replace("```", "") if "```" in candidate else candidate
-    repair_user = REPAIR_USER_TMPL.format(broken_json_block=block)
+        user_prompt = f"""User Request: {user_input}
 
-    if provider == "openai":
-        if client is None:
-            LOG.error("OpenAI client missing for JSON repair.")
-            sys.exit(1)
-        messages = [
-            {"role": "system", "content": REPAIR_SYSTEM},
-            {"role": "user", "content": repair_user},
-        ]
-        fixed = _chat_complete_openai(
-            client,
-            messages,
-            temperature=0.0,
-            top_p=top_p,
-            max_tokens=min(max_tokens, 500),
-            model_name=model_name,
-        )
-    elif provider == "hf":
-        token = hf_token or os.getenv("HF_API_TOKEN")
-        if not token:
-            LOG.error("HF token missing for JSON repair. Use --hf_token or set HF_API_TOKEN.")
-            sys.exit(1)
-        prompt = f"{REPAIR_SYSTEM}\n\n{repair_user}"
-        fixed = _chat_complete_hf(
-            hf_token=token,
-            model_name=model_name or DEFAULT_HF_MODEL,
-            prompt=prompt,
-            temperature=0.0,
-            top_p=top_p,
-            max_new_tokens=min(max_tokens, 500),
-        )
-    else:
-        LOG.error("Unknown provider: %s", provider)
-        sys.exit(1)
+Create a structured plan in JSON format."""
 
-    fixed = _strip_code_fences(fixed)
-    try:
-        return json.loads(fixed)
-    except Exception:
-        LOG.error("JSON repair failed.\n-- Original --\n%s\n-- Repaired --\n%s", raw_text, fixed)
-        raise
+        print("\n[STAGE 1] Generating Plan...")
+        
+        response = self.call_llm(system_prompt, user_prompt)
+        
+        # Try to parse JSON
+        try:
+            plan = json.loads(response)
+            self._validate_plan(plan)
+            print("[STAGE 1] Plan generated successfully")
+            return plan
+        
+        except json.JSONDecodeError:
+            print("[WARNING] JSON parse error, attempting repair...")
+            return self._repair_json(response)
+    
+    def _validate_plan(self, plan: Dict[str, Any]) -> None:
+        """Validate plan structure"""
+        required_fields = ["steps", "assumptions", "success_criteria"]
+        for field in required_fields:
+            if field not in plan:
+                raise ValueError(f"Missing required field: {field}")
+            if not isinstance(plan[field], list):
+                raise ValueError(f"Field {field} must be a list")
+    
+    def _repair_json(self, text: str) -> Dict[str, Any]:
+        """
+        Attempt to repair malformed JSON output
+        
+        Args:
+            text: Potentially malformed JSON text
+            
+        Returns:
+            Parsed JSON dictionary
+        """
+        # Remove markdown code blocks
+        text = text.replace("```json", "").replace("```", "").strip()
+        
+        # Try parsing again
+        try:
+            plan = json.loads(text)
+            self._validate_plan(plan)
+            print("[INFO] JSON repaired successfully")
+            return plan
+        except Exception as e:
+            print(f"[ERROR] Could not repair JSON: {e}", file=sys.stderr)
+            raise ValueError("Failed to generate valid plan JSON")
+    
+    def stage_2_execution(self, user_input: str, plan: Dict[str, Any]) -> str:
+        """
+        Stage 2: Generate final response using the plan
+        
+        Args:
+            user_input: Original user request
+            plan: Structured plan from stage 1
+            
+        Returns:
+            Markdown-formatted final response
+        """
+        system_prompt = """You are a helpful assistant that creates detailed, user-friendly responses.
 
-# ------------------------------- Chains -------------------------------- #
+You will receive:
+1. The original user request
+2. A structured plan with steps, assumptions, and success criteria
 
-def run_planner(
-    *,
-    provider: str,
-    model_name: str,
-    client: Optional[Any],
-    hf_token: Optional[str],
-    user_prompt: str,
-    temperature: float,
-    top_p: float,
-    max_tokens: int,
-) -> Dict[str, Any]:
-    """Chain 1: create a JSON plan."""
-    messages = [
-        {"role": "system", "content": PLANNER_SYSTEM},
-        {"role": "user", "content": PLANNER_USER_TMPL.format(user_prompt=user_prompt)},
-    ]
+Your task:
+- Create a comprehensive response in Markdown format
+- Use clear headings and bullet points
+- Include a "Next Steps" section at the end
+- Be practical, friendly, and actionable
+- Reference the plan steps naturally in your response"""
 
-    if provider == "openai":
-        if client is None:
-            LOG.error("OpenAI client not initialized.")
-            sys.exit(1)
-        raw = _chat_complete_openai(
-            client,
-            messages,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=min(max_tokens, 800),
-            model_name=model_name,
-        )
-    elif provider == "hf":
-        token = hf_token or os.getenv("HF_API_TOKEN")
-        if not token:
-            LOG.error("HF token missing. Use --hf_token or set HF_API_TOKEN.")
-            sys.exit(1)
-        prompt = f"{PLANNER_SYSTEM}\n\n{PLANNER_USER_TMPL.format(user_prompt=user_prompt)}"
-        raw = _chat_complete_hf(
-            hf_token=token,
-            model_name=model_name or DEFAULT_HF_MODEL,
-            prompt=prompt,
-            temperature=temperature,
-            top_p=top_p,
-            max_new_tokens=min(max_tokens, 700),
-        )
-    else:
-        LOG.error("Unknown provider: %s", provider)
-        sys.exit(1)
+        user_prompt = f"""Original Request:
+{user_input}
 
-    plan = _parse_or_repair_json(
-        provider=provider,
-        model_name=model_name,
-        client=client,
-        hf_token=hf_token,
-        raw_text=raw,
-        temperature=temperature,
-        top_p=top_p,
-        max_tokens=max_tokens,
+Plan:
+{json.dumps(plan, indent=2)}
+
+Generate a complete, user-friendly response in Markdown format."""
+
+        print("\n[STAGE 2] Generating Final Response...")
+        
+        response = self.call_llm(system_prompt, user_prompt)
+        
+        print("[STAGE 2] Final response generated")
+        return response
+    
+    def run(self, user_input: str) -> Dict[str, Any]:
+        """
+        Run the complete two-stage chain
+        
+        Args:
+            user_input: User's initial request
+            
+        Returns:
+            Dictionary with plan and final_response
+        """
+        print(f"\n{'='*60}")
+        print(f"USER INPUT: {user_input}")
+        print(f"{'='*60}")
+        
+        # Stage 1: Planning
+        plan = self.stage_1_planning(user_input)
+        
+        # Stage 2: Execution
+        final_response = self.stage_2_execution(user_input, plan)
+        
+        return {
+            "user_input": user_input,
+            "plan": plan,
+            "final_response": final_response
+        }
+
+
+def main():
+    """Main CLI entry point"""
+    parser = argparse.ArgumentParser(
+        description="Prompt Chaining App - Recipe Optimizer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python app.py --prompt "5 vegetarian dinners under 30 minutes"
+  python app.py --prompt "Meal plan for weight loss, 1500 cal/day" --temperature 0.5
+  python app.py --provider openrouter --model "anthropic/claude-3-sonnet"
+        """
     )
-    return _validate_plan_shape(plan)
-
-
-def run_answerer(
-    *,
-    provider: str,
-    model_name: str,
-    client: Optional[Any],
-    hf_token: Optional[str],
-    user_prompt: str,
-    plan: Dict[str, Any],
-    temperature: float,
-    top_p: float,
-    max_tokens: int,
-) -> str:
-    """Chain 2: produce final Markdown using the plan and original request."""
-    plan_json = json.dumps(plan, ensure_ascii=False, indent=2)
-    messages = [
-        {"role": "system", "content": ANSWER_SYSTEM},
-        {"role": "user", "content": ANSWER_USER_TMPL.format(user_prompt=user_prompt, plan_json=plan_json)},
-    ]
-
-    if provider == "openai":
-        if client is None:
-            LOG.error("OpenAI client not initialized.")
-            sys.exit(1)
-        return _chat_complete_openai(
-            client,
-            messages,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            model_name=model_name,
-        )
-    elif provider == "hf":
-        token = hf_token or os.getenv("HF_API_TOKEN")
-        if not token:
-            LOG.error("HF token missing. Use --hf_token or set HF_API_TOKEN.")
-            sys.exit(1)
-        prompt = f"{ANSWER_SYSTEM}\n\n{ANSWER_USER_TMPL.format(user_prompt=user_prompt, plan_json=plan_json)}"
-        return _chat_complete_hf(
-            hf_token=token,
-            model_name=model_name or DEFAULT_HF_MODEL,
-            prompt=prompt,
-            temperature=temperature,
-            top_p=top_p,
-            max_new_tokens=min(max_tokens, 900),
-        )
-    else:
-        LOG.error("Unknown provider: %s", provider)
-        sys.exit(1)
-
-# -------------------------------- CLI --------------------------------- #
-
-def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Two-Stage Prompt Chaining CLI (OpenAI or Hugging Face)",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        required=True,
+        help="User input/request"
     )
-    p.add_argument("--prompt", required=True, help="User request (English)")
-    p.add_argument("--provider", choices=["openai", "hf"], default="openai", help="LLM provider")
-    p.add_argument("--model", type=str, default=DEFAULT_OPENAI_MODEL, help="Model name (OpenAI) or repo id (HF)")
-    p.add_argument("--temperature", type=float, default=0.4, help="Sampling temperature")
-    p.add_argument("--top_p", type=float, default=1.0, help="Top-p nucleus sampling")
-    p.add_argument("--max_tokens", type=int, default=1200, help="Token limit per call (OpenAI:max_tokens, HF:max_new_tokens)")
-    p.add_argument("--api_key", type=str, default=None, help="OpenAI API key (or set OPENAI_API_KEY)")
-    p.add_argument("--hf_token", type=str, default=None, help="Hugging Face API token (or set HF_API_TOKEN)")
-    p.add_argument("--verbose", action="store_true", help="Enable verbose logging")
-    return p
-
-
-def main() -> int:
-    parser = _build_parser()
+    
+    parser.add_argument(
+        "--provider",
+        type=str,
+        choices=["openai", "openrouter"],
+        default="openai",
+        help="API provider (default: openai)"
+    )
+    
+    parser.add_argument(
+        "--model",
+        type=str,
+        help="Model name (default: gpt-4-turbo-preview for OpenAI, openai/gpt-4-turbo for OpenRouter)"
+    )
+    
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature (default: 0.7)"
+    )
+    
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=1.0,
+        help="Nucleus sampling parameter (default: 1.0)"
+    )
+    
+    parser.add_argument(
+        "--max_tokens",
+        type=int,
+        default=2000,
+        help="Maximum tokens to generate (default: 2000)"
+    )
+    
+    parser.add_argument(
+        "--output",
+        type=str,
+        help="Save output to JSON file"
+    )
+    
     args = parser.parse_args()
-
-    if args.verbose:
-        LOG.setLevel(logging.DEBUG)
-
-    # Provider wiring
-    if args.provider == "openai":
-        client = _make_openai_client(args.api_key)
-        model_name = args.model or DEFAULT_OPENAI_MODEL
-        hf_token = None
-    elif args.provider == "hf":
-        client = None
-        model_name = args.model or DEFAULT_HF_MODEL
-        hf_token = args.hf_token or os.getenv("HF_API_TOKEN")
-        if not hf_token:
-            LOG.error("HF token missing. Use --hf_token or set HF_API_TOKEN.")
-            return 1
+    
+    # Set defaults based on provider
+    if args.provider == "openrouter":
+        base_url = "https://openrouter.ai/api/v1"
+        model = args.model or "openai/gpt-4-turbo"
+        api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
     else:
-        LOG.error("Unknown provider: %s", args.provider)
-        return 1
-
+        base_url = None
+        model = args.model or "gpt-4-turbo-preview"
+        api_key = os.getenv("OPENAI_API_KEY")
+    
     try:
-        plan = run_planner(
-            provider=args.provider,
-            model_name=model_name,
-            client=client,
-            hf_token=hf_token,
-            user_prompt=args.prompt,
+        # Initialize app
+        app = PromptChainApp(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
             temperature=args.temperature,
             top_p=args.top_p,
-            max_tokens=args.max_tokens,
+            max_tokens=args.max_tokens
         )
-
-        print("\n" + "=" * 10 + " PLAN (Chain 1) " + "=" * 10)
-        print(json.dumps(plan, ensure_ascii=False, indent=2))
-
-        final_md = run_answerer(
-            provider=args.provider,
-            model_name=model_name,
-            client=client,
-            hf_token=hf_token,
-            user_prompt=args.prompt,
-            plan=plan,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            max_tokens=args.max_tokens,
-        )
-
-        print("\n" + "=" * 10 + " FINAL ANSWER (Chain 2) " + "=" * 10)
-        print(final_md)
-        return 0
-
-    except KeyboardInterrupt:
-        LOG.warning("Interrupted by user.")
-        return 130
-    except Exception as exc:
-        LOG.error("Fatal error: %s", exc)
-        return 1
+        
+        # Run the chain
+        result = app.run(args.prompt)
+        
+        # Display results
+        print(f"\n{'='*60}")
+        print("PLAN (JSON)")
+        print(f"{'='*60}")
+        print(json.dumps(result["plan"], indent=2, ensure_ascii=False))
+        
+        print(f"\n{'='*60}")
+        print("FINAL RESPONSE (Markdown)")
+        print(f"{'='*60}")
+        print(result["final_response"])
+        
+        # Save to file if requested
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
+            print(f"\n[INFO] Results saved to {args.output}")
+        
+        print(f"\n{'='*60}")
+        print("COMPLETED SUCCESSFULLY")
+        print(f"{'='*60}\n")
+    
+    except Exception as e:
+        print(f"\n[ERROR] {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

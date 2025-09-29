@@ -1,0 +1,46 @@
+# Example Inputs for Recipe Optimizer - Prompt Chaining Project
+
+# at least 3 inputs exampeles
+
+## Example 1: Quick Vegetarian Meals (Basic)
+5 vegetarian dinner recipes that take under 30 minutes to prepare, budget-friendly with common ingredients
+
+## Example 2: Meal Prep for Fitness (Advanced)
+Create a 7-day meal plan for muscle building, high protein, approximately 2500 calories per day, includes prep instructions for batch cooking
+
+## Example 3: Family-Friendly Budget Cooking (Complex)
+Plan 10 family-friendly dinners for 4 people, total budget 100 dollars, mix of cuisines, kid-approved, batch cooking friendly, include shopping list
+
+## Additional Examples 
+
+## Example 4: Dietary Restrictions
+Give me 5 dinner ideas that are gluten-free, dairy-free, and low-carb, suitable for meal prep, under 500 calories each, with macro breakdown
+
+## Example 5: International Cuisine Learning
+I want to learn cooking Asian cuisine. Give me 5 beginner-friendly recipes from different Asian countries (Chinese, Japanese, Thai, Korean, Vietnamese) with step-by-step guidance and ingredient substitutions
+
+## Example 6: Quick Breakfast Ideas
+7 different breakfast options that take less than 15 minutes, high in protein, suitable for busy mornings, can be prepared night before
+
+## Example 7: Healthy Desserts
+5 healthy dessert recipes using natural sweeteners, under 200 calories per serving, no refined sugar, includes chocolate options
+
+## Example 8: Soup Week
+Plan a week of different soup recipes, each serves 6 portions, suitable for freezing, budget under 50 dollars total, nutritious and filling
+
+## example for usage
+
+# ex 1 - basic usage
+python application.py --prompt "5 vegetarian dinner recipes that take under 30 minutes to prepare, budget-friendly with common ingredients"
+
+# ex 2 - Parametrelerle
+python application.py --prompt "Create a 7-day meal plan for muscle building, high protein, approximately 2500 calories per day, includes prep instructions for batch cooking" --temperature 0.5 --output meal_plan.json
+
+# ex 3 - Max detail
+python application.py --prompt "Plan 10 family-friendly dinners for 4 people, total budget 100 dollars, mix of cuisines, kid-approved, batch cooking friendly, include shopping list" --max_tokens 3000 --output family_plan.json
+
+# OpenRouter ile
+python application.py --provider openrouter --model "openai/gpt-4-turbo" --prompt "5 vegetarian dinner recipes under 30 minutes"
+
+# LangChain version
+python app_langchain.py --prompt "7-day meal plan for muscle building" --output langchain_test.json
