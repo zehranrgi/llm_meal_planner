@@ -1,4 +1,4 @@
-# Meal Planner Lite
+# Meal Planner
 
 
 1. It should be runnable from the command line: python app.py --prompt "example user request :white_check_mark: 
