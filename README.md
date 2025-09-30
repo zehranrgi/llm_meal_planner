@@ -1,7 +1,5 @@
-# llm_trip_planner
+# Meal Planner Lite
 
-
-## Meal Planner Lite
 
 1. It should be runnable from the command line: python app.py --prompt "example user request :white_check_mark: 
 2. runnable from CLI --temperature, --top_p, --max_tokens parametreleri CLI  :white_check_mark: 
