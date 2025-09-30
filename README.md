@@ -39,4 +39,6 @@
 
 <img width="1191" height="1052" alt="image" src="https://github.com/user-attachments/assets/e32b4b03-71ad-46aa-a43f-43b16e86c72f" />
 
+6. Flask-ui (not done fully)
+   <img width="1351" height="803" alt="image" src="https://github.com/user-attachments/assets/e6acccce-2428-4b27-9b3d-55260b392674" />
 
